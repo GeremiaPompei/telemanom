@@ -1,3 +1,4 @@
+import json
 import os
 import numpy as np
 import pandas as pd
@@ -8,7 +9,6 @@ from telemanom.helpers import Config
 from telemanom.errors import Errors
 import telemanom.helpers as helpers
 from telemanom.channel import Channel
-from telemanom.modeling import Model
 
 logger = helpers.setup_logging()
 
@@ -59,18 +59,19 @@ class Detector:
         else:
             self.id = dt.now().strftime('%Y-%m-%d_%H.%M.%S')
 
-        helpers.make_dirs(self.id)
+        # helpers.make_dirs(self.id)
 
         # add logging FileHandler based on ID
-        hdlr = logging.FileHandler('data/logs/%s.log' % self.id)
-        formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-        hdlr.setFormatter(formatter)
-        logger.addHandler(hdlr)
+        # hdlr = logging.FileHandler('data/logs/%s.log' % self.id)
+        # formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+        # hdlr.setFormatter(formatter)
+        # logger.addHandler(hdlr)
 
         self.result_path = result_path
 
         if self.labels_path:
             self.chan_df = pd.read_csv(labels_path)
+            self.chan_df = self.chan_df.sort_values(by='chan_id')
         else:
             chan_ids = [x.split('.')[0] for x in os.listdir('data/test/')]
             self.chan_df = pd.DataFrame({"chan_id": chan_ids})
@@ -189,25 +190,53 @@ class Detector:
                         .format(self.result_df['num_test_values'].sum()))
 
 
-    def run(self):
+    def run(self, model_type):
         """
         Initiate processing for all channels.
         """
         for i, row in self.chan_df.iterrows():
+            if i < 1:
+                continue
             logger.info('Stream # {}: {}'.format(i+1, row.chan_id))
             channel = Channel(self.config, row.chan_id)
             channel.load_data()
 
             if self.config.predict:
-                model = Model(self.config, self.id, channel)
+                model = model_type(self.config, self.id, channel)
                 channel = model.batch_predict(channel)
             else:
-                channel.y_hat = np.load(os.path.join('data', self.id, 'y_hat',
-                                                     '{}.npy'
-                                                     .format(channel.id)))
+                channel.y_test = np.load(
+                    '/Users/geremiapompei/Desktop/Lavoro/ContinualIST/space-ai/debug/y_trg-{}.npy'.format(channel.id)).reshape(-1, 1, 1).astype(np.float32)
+                channel.y_hat = np.load('/Users/geremiapompei/Desktop/Lavoro/ContinualIST/space-ai/debug/y_pred-{}.npy'.format(
+                    channel.id)).reshape(-1, 1).astype(np.float32)
+            #     channel.y_hat = np.load(os.path.join('data', self.id, 'y_hat',
+            #                                          '{}.npy'
+            #                                          .format(channel.id)))
+                
+            # import matplotlib.pyplot as plt
+            # plt.figure()
+            # plt.plot(channel.y_hat.reshape(-1), label='y_hat')
+            # plt.plot(channel.y_test.reshape(-1), label='y_test')
+            # plt.legend()
+            # plt.show()
 
             errors = Errors(channel, self.config, self.id)
             errors.process_batches(channel)
+
+
+            tel_anom_scores_path = 'tel_anom_scores.csv'  # TODO GERE
+            if os.path.exists(tel_anom_scores_path):  # TODO GERE
+                df_scores = pd.read_csv(tel_anom_scores_path)  # TODO GERE
+            else:  # TODO GERE
+                df_scores = pd.DataFrame()  # TODO GERE
+            for score in errors.anom_scores:
+                toappend = {'channel': row.chan_id, 'start_idx': score['start_idx'],
+                            'end_idx': score['end_idx'], 'score': score['score']}  # TODO GERE
+                df_scores = df_scores._append(
+                    toappend, ignore_index=True)  # TODO GERE
+            if len(df_scores) > 0:  # TODO GERE
+                df_scores.to_csv(tel_anom_scores_path, index=False)  # TODO GERE
+            
 
             result_row = {
                 'run_id': self.id,

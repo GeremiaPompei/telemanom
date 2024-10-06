@@ -8,3 +8,4 @@ telemanom/__pycache__*
 # results/20*
 data.zip*
 .idea/*
+venv

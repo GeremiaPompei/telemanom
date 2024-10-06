@@ -10,7 +10,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 logger = logging.getLogger('telemanom')
 
 
-class LSTMModel:
+class ESNModel:
     def __init__(self, config, run_id, channel):
         """
         Loads/trains RNN and predicts future telemetry values for a channel.
@@ -79,15 +79,16 @@ class LSTMModel:
             self.config.layers[0],
             input_shape=(None, channel.X_train.shape[2]),
             return_sequences=True))
-        # self.model.add(Dropout(self.config.dropout))
+        self.model.add(Dropout(self.config.dropout))
 
         self.model.add(LSTM(
             self.config.layers[1],
-            return_sequences=True))
+            return_sequences=False))
         self.model.add(Dropout(self.config.dropout))
 
-        self.model.add(Dense(self.config.n_predictions))
-        # self.model.add(Activation('linear'))
+        self.model.add(Dense(
+            self.config.n_predictions))
+        self.model.add(Activation('linear'))
 
         self.model.compile(loss=self.config.loss_metric,
                            optimizer=self.config.optimizer)
@@ -150,7 +151,7 @@ class LSTMModel:
             channel (obj): Channel class object with y_hat values as attribute
         """
 
-        """num_batches = int((channel.y_test.shape[0] - self.config.l_s)
+        num_batches = int((channel.y_test.shape[0] - self.config.l_s)
                           / self.config.batch_size)
         if num_batches < 0:
             raise ValueError('l_s ({}) too large for stream length {}.'
@@ -167,9 +168,9 @@ class LSTMModel:
 
             X_test_batch = channel.X_test[prior_idx:idx]
             y_hat_batch = self.model.predict(X_test_batch)
-            self.aggregate_predictions(y_hat_batch)"""
+            self.aggregate_predictions(y_hat_batch)
 
-        self.y_hat = self.model.predict(channel.X_test)[:, -1] #np.reshape(self.y_hat, (self.y_hat.size,))
+        self.y_hat = np.reshape(self.y_hat, (self.y_hat.size,))
 
         channel.y_hat = self.y_hat
 

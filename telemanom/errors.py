@@ -1,7 +1,6 @@
-import numpy as np
-import pandas as pd
-import more_itertools as mit
 import os
+import numpy as np
+import more_itertools as mit
 import logging
 
 logger = logging.getLogger('telemanom')
@@ -34,7 +33,6 @@ class Errors:
             normalized (arr): prediction errors as a percentage of the range
                 of the channel values
         """
-
         self.config = config
         self.window_size = self.config.window_size
         self.n_windows = int((channel.y_test.shape[0] -
@@ -45,8 +43,8 @@ class Errors:
         self.anom_scores = []
 
         # raw prediction error
-        self.e = [abs(y_h-y_t[0]) for y_h, y_t in
-                  zip(channel.y_hat, channel.y_test)]
+        self.e = np.concatenate([abs(y_h[0]-y_t[0]) for y_h, y_t in
+                  zip(channel.y_hat, channel.y_test)])
 
         smoothing_window = int(self.config.batch_size * self.config.window_size
                                * self.config.smoothing_perc)
@@ -55,17 +53,16 @@ class Errors:
                              .format(len(channel.y_hat), len(channel.y_test)))
 
         # smoothed prediction error
-        self.e_s = pd.DataFrame(self.e).ewm(span=smoothing_window)\
-            .mean().values.flatten()
+        self.e_s = EWMA(smoothing_window)(self.e)
 
         # for values at beginning < sequence length, just use avg
-        if not channel.id == 'C-2':  # anomaly occurs early in window
-            self.e_s[:self.config.l_s] = \
-                [np.mean(self.e_s[:self.config.l_s * 2])] * self.config.l_s
+        # if not channel.id == 'C-2':  # anomaly occurs early in window
+        #     self.e_s[:self.config.l_s] = \
+        #         [np.mean(self.e_s[:self.config.l_s * 2])] * self.config.l_s
 
-        np.save(os.path.join('data', run_id, 'smoothed_errors', '{}.npy'
-                             .format(channel.id)),
-                np.array(self.e_s))
+        # np.save(os.path.join('data', run_id, 'smoothed_errors', '{}.npy'
+        #                      .format(channel.id)),
+        #         np.array(self.e_s))
 
         self.normalized = np.mean(self.e / np.ptp(channel.y_test))
         logger.info("normalized prediction error: {0:.2f}"
@@ -118,8 +115,10 @@ class Errors:
                 for X,y for a single channel
         """
 
-        self.adjust_window_size(channel)
-
+        #self.adjust_window_size(channel)
+        sd_values = np.std(channel.y_test)
+        perc_high, perc_low = np.percentile(channel.y_test, [95, 5])
+        inter_range = perc_high - perc_low
         for i in range(0, self.n_windows+1):
             prior_idx = i * self.config.batch_size
             idx = (self.config.window_size * self.config.batch_size) \
@@ -127,7 +126,7 @@ class Errors:
             if i == self.n_windows:
                 idx = channel.y_test.shape[0]
 
-            window = ErrorWindow(channel, self.config, prior_idx, idx, self, i)
+            window = ErrorWindow(channel, self.config, prior_idx, idx, self, i, sd_values, inter_range)
 
             window.find_epsilon()
             window.find_epsilon(inverse=True)
@@ -156,20 +155,18 @@ class Errors:
             # group anomalous indices into continuous sequences
             groups = [list(group) for group in
                       mit.consecutive_groups(self.i_anom)]
-            self.E_seq = [(int(g[0]), int(g[-1])) for g in groups
-                          if not g[0] == g[-1]]
+            self.E_seq = [(int(g[0]), int(g[-1])) for g in groups if not g[0] == g[-1]]
 
             # additional shift is applied to indices so that they represent the
             # position in the original data array, obtained from the .npy files,
             # and not the position on y_test (See PR #27).
-            self.E_seq = [(e_seq[0] + self.config.l_s,
-                           e_seq[1] + self.config.l_s) for e_seq in self.E_seq]
+            self.E_seq = [(e_seq[0] + self.config.l_s, e_seq[1] + self.config.l_s) for e_seq in self.E_seq]
 
             self.merge_scores()
 
 
 class ErrorWindow:
-    def __init__(self, channel, config, start_idx, end_idx, errors, window_num):
+    def __init__(self, channel, config, start_idx, end_idx, errors, window_num, sd_values, inter_range):
         """
         Data and calculations for a specific window of prediction errors.
         Includes finding thresholds, pruning, and scoring anomalous sequences
@@ -252,19 +249,16 @@ class ErrorWindow:
         self.epsilon = self.mean_e_s + self.sd_lim * self.sd_e_s
         self.epsilon_inv = self.mean_e_s + self.sd_lim * self.sd_e_s
 
-        self.y_test = channel.y_test[start_idx:end_idx]
-        self.sd_values = np.std(self.y_test)
-
-        self.perc_high, self.perc_low = np.percentile(self.y_test, [95, 5])
-        self.inter_range = self.perc_high - self.perc_low
+        self.sd_values = sd_values
+        self.inter_range = inter_range
 
         # ignore initial error values until enough history for processing
         self.num_to_ignore = self.config.l_s * 2
-        # if y_test is small, ignore fewer
-        if len(channel.y_test) < 2500:
-            self.num_to_ignore = self.config.l_s
-        if len(channel.y_test) < 1800:
-            self.num_to_ignore = 0
+        # # if y_test is small, ignore fewer
+        # if len(channel.y_test) < 2500:
+        #     self.num_to_ignore = self.config.l_s
+        # if len(channel.y_test) < 1800:
+        #     self.num_to_ignore = 0
 
     def find_epsilon(self, inverse=False):
         """
@@ -278,48 +272,93 @@ class ErrorWindow:
         Args:
             inverse (bool): If true, epsilon is calculated for inverted errors
         """
+        # e_s = self.e_s if not inverse else self.e_s_inv
+
+        # max_score = -10000000
+
+        # for z in np.arange(2.5, self.sd_lim, 0.5):
+        #     epsilon = self.mean_e_s + (self.sd_e_s * z)
+
+        #     pruned_e_s = e_s[e_s < epsilon]
+
+        #     i_anom = np.argwhere(e_s >= epsilon).reshape(-1,)
+        #     buffer = np.arange(1, self.config.error_buffer)
+        #     i_anom = np.sort(np.concatenate((i_anom,
+        #                                     np.array([i+buffer for i in i_anom])
+        #                                      .flatten(),
+        #                                     np.array([i-buffer for i in i_anom])
+        #                                      .flatten())))
+        #     i_anom = i_anom[(i_anom < len(e_s)) & (i_anom >= 0)]
+        #     i_anom = np.sort(np.unique(i_anom))
+
+        #     if len(i_anom) > 0:
+        #         # group anomalous indices into continuous sequences
+        #         groups = [list(group) for group
+        #                   in mit.consecutive_groups(i_anom)]
+        #         E_seq = [(g[0], g[-1]) for g in groups if not g[0] == g[-1]]
+
+        #         mean_perc_decrease = (self.mean_e_s - np.mean(pruned_e_s)) \
+        #                              / self.mean_e_s
+        #         sd_perc_decrease = (self.sd_e_s - np.std(pruned_e_s)) \
+        #                            / self.sd_e_s
+        #         score = (mean_perc_decrease + sd_perc_decrease) \
+        #                 / (len(E_seq) ** 2 + len(i_anom))
+
+        #         # sanity checks / guardrails
+        #         if score >= max_score and len(E_seq) <= 5 and \
+        #                 len(i_anom) < (len(e_s) * 0.5):
+        #             max_score = score
+        #             if not inverse:
+        #                 self.sd_threshold = z
+        #                 self.epsilon = self.mean_e_s + z * self.sd_e_s
+        #             else:
+        #                 self.sd_threshold_inv = z
+        #                 self.epsilon_inv = self.mean_e_s + z * self.sd_e_s
+
         e_s = self.e_s if not inverse else self.e_s_inv
+        sd_threshold = self.sd_threshold if not inverse else self.sd_threshold_inv
+        # epsilon = mean_e_s + self.sd_threshold_inv * sd_e_s
 
-        max_score = -10000000
-
+        max_score = float("-inf")
         for z in np.arange(2.5, self.sd_lim, 0.5):
-            epsilon = self.mean_e_s + (self.sd_e_s * z)
+            epsilon_z = self.mean_e_s + (self.sd_e_s * z)
 
-            pruned_e_s = e_s[e_s < epsilon]
+            pruned_e_s = e_s[e_s < epsilon_z]
 
-            i_anom = np.argwhere(e_s >= epsilon).reshape(-1,)
-            buffer = np.arange(1, self.config.error_buffer)
-            i_anom = np.sort(np.concatenate((i_anom,
-                                            np.array([i+buffer for i in i_anom])
-                                             .flatten(),
-                                            np.array([i-buffer for i in i_anom])
-                                             .flatten())))
-            i_anom = i_anom[(i_anom < len(e_s)) & (i_anom >= 0)]
-            i_anom = np.sort(np.unique(i_anom))
-
+            i_anom = np.argwhere(e_s >= epsilon_z).reshape(-1)
             if len(i_anom) > 0:
-                # group anomalous indices into continuous sequences
-                groups = [list(group) for group
-                          in mit.consecutive_groups(i_anom)]
-                E_seq = [(g[0], g[-1]) for g in groups if not g[0] == g[-1]]
+                e_buf = self.config.error_buffer
+                i_anom = np.concatenate(
+                    [np.arange(i - e_buf, i + e_buf) for i in i_anom]
+                )
+                i_anom = i_anom[(i_anom < len(e_s)) & (i_anom >= 0)]
+                i_anom = np.sort(np.unique(i_anom))
 
-                mean_perc_decrease = (self.mean_e_s - np.mean(pruned_e_s)) \
-                                     / self.mean_e_s
-                sd_perc_decrease = (self.sd_e_s - np.std(pruned_e_s)) \
-                                   / self.sd_e_s
-                score = (mean_perc_decrease + sd_perc_decrease) \
-                        / (len(E_seq) ** 2 + len(i_anom))
+                # group anomalous indices into continuous sequences
+                groups = [list(group)
+                          for group in mit.consecutive_groups(i_anom)]
+                e_seq = [(g[0], g[-1]) for g in groups if not g[0] == g[-1]]
+
+                mean_perc_decr = float(
+                    (self.mean_e_s - np.mean(pruned_e_s)) / self.mean_e_s)
+                sd_perc_decr = float((self.sd_e_s - np.std(pruned_e_s)) / self.sd_e_s)
+                score = (mean_perc_decr + sd_perc_decr) / (
+                    len(e_seq) ** 2 + len(i_anom)
+                )
 
                 # sanity checks / guardrails
-                if score >= max_score and len(E_seq) <= 5 and \
-                        len(i_anom) < (len(e_s) * 0.5):
+                if (
+                    score >= max_score
+                    and len(e_seq) <= 5
+                    and len(i_anom) < (len(e_s) * 0.5)
+                ):
                     max_score = score
                     if not inverse:
                         self.sd_threshold = z
-                        self.epsilon = self.mean_e_s + z * self.sd_e_s
+                        self.epsilon = epsilon_z
                     else:
                         self.sd_threshold_inv = z
-                        self.epsilon_inv = self.mean_e_s + z * self.sd_e_s
+                        self.epsilon_inv = epsilon_z
 
     def compare_to_epsilon(self, errors_all, inverse=False):
         """
@@ -334,53 +373,101 @@ class ErrorWindow:
         e_s = self.e_s if not inverse else self.e_s_inv
         epsilon = self.epsilon if not inverse else self.epsilon_inv
 
-        # Check: scale of errors compared to values too small?
-        if not (self.sd_e_s > (.05 * self.sd_values) or max(self.e_s)
-                > (.05 * self.inter_range)) or not max(self.e_s) > 0.05:
-            return
+        # # Check: scale of errors compared to values too small?
+        # if not (self.sd_e_s > (.05 * self.sd_values) or max(self.e_s) > (.05 * self.inter_range)) or not max(self.e_s) > 0.05:
+        #     return
 
-        i_anom = np.argwhere((e_s >= epsilon) &
-                             (e_s > 0.05 * self.inter_range)).reshape(-1,)
+        # i_anom = np.argwhere((e_s >= epsilon) &
+        #                      (e_s > 0.05 * self.inter_range)).reshape(-1,)
+
+        # if len(i_anom) == 0:
+        #     return
+        # buffer = np.arange(1, self.config.error_buffer+1)
+        # i_anom = np.sort(np.concatenate((i_anom,
+        #                                  np.array([i + buffer for i in i_anom])
+        #                                  .flatten(),
+        #                                  np.array([i - buffer for i in i_anom])
+        #                                  .flatten())))
+        # i_anom = i_anom[(i_anom < len(e_s)) & (i_anom >= 0)]
+
+        # # if it is first window, ignore initial errors (need some history)
+        # if self.window_num == 0:
+        #     i_anom = i_anom[i_anom >= self.num_to_ignore]
+        # else:
+        #     i_anom = i_anom[i_anom >= len(e_s) - self.config.batch_size]
+
+        # i_anom = np.sort(np.unique(i_anom))
+
+        # # capture max of non-anomalous values below the threshold
+        # # (used in filtering process)
+        # # TODO GERE
+        # # batch_position = self.window_num * self.config.batch_size
+        # # window_indices = np.arange(0, len(e_s)) + batch_position
+        # # adj_i_anom = i_anom + batch_position
+        # # window_indices = np.setdiff1d(window_indices,
+        # #                               np.append(errors_all.i_anom, adj_i_anom))
+        # # candidate_indices = np.unique(window_indices - batch_position)
+        # # non_anom_max = np.max(np.take(e_s, candidate_indices))
+        # non_anom_max = np.amax(np.delete(e_s, i_anom))
+
+        # # group anomalous indices into continuous sequences
+        # groups = [list(group) for group in mit.consecutive_groups(i_anom)]
+        # E_seq = [(g[0], g[-1]) for g in groups if not g[0] == g[-1]]
+
+        # if inverse:
+        #     self.i_anom_inv = i_anom
+        #     self.E_seq_inv = E_seq
+        #     self.non_anom_max_inv = non_anom_max
+        # else:
+        #     self.i_anom = i_anom
+        #     self.E_seq = E_seq
+        #     self.non_anom_max = non_anom_max
+
+        max_error = max(e_s)
+        if (
+            not (
+                self.sd_e_s > (0.05 * self.sd_values)
+                or max_error > (0.05 * self.inter_range)
+            )
+            or not max_error > 0.05
+        ):
+            return np.array([]), [], float("-inf")
+
+        i_anom = np.argwhere(
+            (e_s >= epsilon) & (e_s > 0.05 * self.inter_range)
+        ).flatten()
 
         if len(i_anom) == 0:
-            return
-        buffer = np.arange(1, self.config.error_buffer+1)
-        i_anom = np.sort(np.concatenate((i_anom,
-                                         np.array([i + buffer for i in i_anom])
-                                         .flatten(),
-                                         np.array([i - buffer for i in i_anom])
-                                         .flatten())))
+            return np.array([]), [], float("-inf")
+        e_buf = self.config.error_buffer
+        i_anom = np.concatenate(
+            [np.arange(i - e_buf, i + e_buf) for i in i_anom])
         i_anom = i_anom[(i_anom < len(e_s)) & (i_anom >= 0)]
+        i_anom = np.sort(np.unique(i_anom))
 
         # if it is first window, ignore initial errors (need some history)
-        if self.window_num == 0:
+        if self.window_num == 0 and self.num_to_ignore > 0:
             i_anom = i_anom[i_anom >= self.num_to_ignore]
         else:
             i_anom = i_anom[i_anom >= len(e_s) - self.config.batch_size]
 
-        i_anom = np.sort(np.unique(i_anom))
-
-        # capture max of non-anomalous values below the threshold
-        # (used in filtering process)
-        batch_position = self.window_num * self.config.batch_size
-        window_indices = np.arange(0, len(e_s)) + batch_position
-        adj_i_anom = i_anom + batch_position
-        window_indices = np.setdiff1d(window_indices,
-                                      np.append(errors_all.i_anom, adj_i_anom))
-        candidate_indices = np.unique(window_indices - batch_position)
-        non_anom_max = np.max(np.take(e_s, candidate_indices))
+        non_anom_max = np.amax(np.delete(e_s, i_anom))
 
         # group anomalous indices into continuous sequences
-        groups = [list(group) for group in mit.consecutive_groups(i_anom)]
-        E_seq = [(g[0], g[-1]) for g in groups if not g[0] == g[-1]]
+        groups = [
+            list(group) for group in mit.consecutive_groups(i_anom)
+        ]
+        e_seq = [
+            (g[0], g[-1]) for g in groups if not g[0] == g[-1]
+        ]
 
         if inverse:
             self.i_anom_inv = i_anom
-            self.E_seq_inv = E_seq
+            self.E_seq_inv = e_seq
             self.non_anom_max_inv = non_anom_max
         else:
             self.i_anom = i_anom
-            self.E_seq = E_seq
+            self.E_seq = e_seq
             self.non_anom_max = non_anom_max
 
     def prune_anoms(self, inverse=False):
@@ -397,35 +484,72 @@ class ErrorWindow:
         non_anom_max = self.non_anom_max if not inverse \
             else self.non_anom_max_inv
 
+        # if len(E_seq) == 0:
+        #     return
+
+        # E_seq_max = np.array([max(e_s[e[0]:e[1]+1]) for e in E_seq])
+        # E_seq_max_sorted = np.sort(E_seq_max)[::-1]
+        # E_seq_max_sorted = np.append(E_seq_max_sorted, [non_anom_max])
+
+        # i_to_remove = np.array([])
+        # for i in range(0, len(E_seq_max_sorted)-1):
+        #     if (E_seq_max_sorted[i] - E_seq_max_sorted[i+1]) \
+        #             / E_seq_max_sorted[i] < self.config.p:
+        #         i_to_remove = np.append(i_to_remove, np.argwhere(
+        #             E_seq_max == E_seq_max_sorted[i]))
+        #     else:
+        #         i_to_remove = np.array([])
+        # i_to_remove[::-1].sort()
+
+        # i_to_remove = np.array(i_to_remove, dtype=int)
+        # if len(i_to_remove) > 0:
+        #     E_seq = np.delete(E_seq, i_to_remove, axis=0)
+
+        # if len(E_seq) == 0:
+        #     if inverse:
+        #         self.i_anom_inv = np.array([])
+        #     else:
+        #         self.i_anom = np.array([])
+        #     return
+
+        # indices_to_keep = np.concatenate(
+        #     [range(subseq[0], subseq[-1] + 1) for subseq in E_seq]
+        # )
+
         if len(E_seq) == 0:
-            return
+            return np.array([])
 
-        E_seq_max = np.array([max(e_s[e[0]:e[1]+1]) for e in E_seq])
-        E_seq_max_sorted = np.sort(E_seq_max)[::-1]
-        E_seq_max_sorted = np.append(E_seq_max_sorted, [non_anom_max])
+        e_seq_max: np.ndarray = np.array(
+            [max(e_s[e[0]: e[1] + 1]) for e in E_seq])
+        e_seq_max_sorted: np.ndarray = np.sort(e_seq_max)[::-1]
+        e_seq_max_sorted = np.append(e_seq_max_sorted, [non_anom_max])
 
-        i_to_remove = np.array([])
-        for i in range(0, len(E_seq_max_sorted)-1):
-            if (E_seq_max_sorted[i] - E_seq_max_sorted[i+1]) \
-                    / E_seq_max_sorted[i] < self.config.p:
-                i_to_remove = np.append(i_to_remove, np.argwhere(
-                    E_seq_max == E_seq_max_sorted[i]))
+        i_to_remove: np.ndarray = np.array([])
+        for i in range(0, len(e_seq_max_sorted) - 1):
+            if (e_seq_max_sorted[i] - e_seq_max_sorted[i + 1]) / e_seq_max_sorted[
+                i
+            ] < self.config.p:
+                i_to_remove = np.append(
+                    i_to_remove, np.argwhere(e_seq_max == e_seq_max_sorted[i])
+                )
             else:
                 i_to_remove = np.array([])
         i_to_remove[::-1].sort()
 
+        i_to_remove = np.array(i_to_remove, dtype=int)
         if len(i_to_remove) > 0:
             E_seq = np.delete(E_seq, i_to_remove, axis=0)
 
-        if len(E_seq) == 0 and inverse:
-            self.i_anom_inv = np.array([])
-            return
-        elif len(E_seq) == 0 and not inverse:
-            self.i_anom = np.array([])
-            return
+        if len(E_seq) == 0:
+            if inverse:
+                self.i_anom_inv = np.array([])
+            else:
+                self.i_anom = np.array([])
+            return np.array([])
 
-        indices_to_keep = np.concatenate([range(e_seq[0], e_seq[-1]+1)
-                                          for e_seq in E_seq])
+        indices_to_keep = np.concatenate(
+            [range(subseq[0], subseq[-1] + 1) for subseq in E_seq]
+        )
 
         if not inverse:
             mask = np.isin(self.i_anom, indices_to_keep)
@@ -465,3 +589,54 @@ class ErrorWindow:
             # or inverted errors
             score_dict['score'] = max([score, inv_score])
             self.anom_scores.append(score_dict)
+
+
+class EWMA:
+    def __init__(self, window_size: int, adjust: bool = True, batch_size: int = 1000):
+        self.window_size = window_size
+        self.adjust = adjust
+        self.batch_size = batch_size
+        alpha = 2 / (window_size + 1.0)
+        self.alpha_rev = 1 - alpha
+        self.alpha = 1 if adjust else alpha
+        self.last_ewma = 0 if self.adjust else None
+        self.last_div = 0
+
+    def reset(self):
+        self.last_ewma = 0 if self.adjust else None
+        self.last_div = 0
+
+    def __call__(self, data: np.ndarray) -> np.ndarray:
+        return np.concatenate(
+            [
+                self.run(data[i: i + self.batch_size])
+                for i in range(0, len(data), self.batch_size)
+            ]
+        )
+
+    def run(self, data: np.ndarray) -> np.ndarray:
+        n = data.shape[0]
+        pows = self.alpha_rev ** np.arange(n + 1)
+
+        if self.last_ewma is None:
+            self.last_ewma = data[0]
+
+        scale_arr = 1 / pows[:-1]
+        offset = self.last_ewma * pows[1:]
+        if self.adjust:
+            offset_div = self.last_div * pows[1:]
+
+        pw0 = self.alpha * self.alpha_rev ** (n - 1)
+
+        mult = data * pw0 * scale_arr
+        cumsums = mult.cumsum()
+        ewma_result = offset + (cumsums * scale_arr[::-1])
+
+        self.last_ewma = ewma_result[-1]
+
+        if self.adjust:
+            div = pows[:-1].cumsum() + offset_div
+            self.last_div = div[-1]
+            return ewma_result / div
+
+        return ewma_result

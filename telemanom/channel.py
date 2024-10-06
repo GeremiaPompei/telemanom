@@ -52,7 +52,7 @@ class Channel:
         """
 
         data = []
-        for i in range(len(arr) - self.config.l_s - self.config.n_predictions):
+        for i in range(len(arr) - self.config.l_s - self.config.n_predictions + 1):
             data.append(arr[i:i + self.config.l_s + self.config.n_predictions])
         data = np.array(data)
 
@@ -60,11 +60,13 @@ class Channel:
 
         if train:
             np.random.shuffle(data)
-            self.X_train = data[:, :-self.config.n_predictions, :]
-            self.y_train = data[:, -self.config.n_predictions:, 0]  # telemetry value is at position 0
+            self.X_train = data[:, :-self.config.n_predictions, :1]
+            # telemetry value is at position 0
+            self.y_train = data[:, self.config.n_predictions:, :1]
         else:
-            self.X_test = data[:, :-self.config.n_predictions, :]
-            self.y_test = data[:, -self.config.n_predictions:, 0]  # telemetry value is at position 0
+            self.X_test = data[:, :-self.config.n_predictions, :1]
+            # telemetry value is at position 0
+            self.y_test = data[:, -self.config.n_predictions:, :1]
 
     def load_data(self):
         """
